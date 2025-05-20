@@ -1,12 +1,9 @@
 """
-RAG-система для работы с 50 млн JSON-записей технической документации
-(основана на Hugging Face и Qdrant с запуском на RunPod.io)
+RAG-система для работы с миллионами JSON-записей технической документации
+и определения кодов КТРУ для товаров в промышленных масштабах
 
 Данная система реализует архитектуру RAG (Retrieval Augmented Generation)
-и позволяет обрабатывать большие объемы структурированных данных JSON,
-динамически добавляя к запросам временные данные.
-
-Используется FastAPI вместо Flask для лучшей производительности и валидации данных.
+и позволяет обрабатывать большие объемы структурированных данных JSON.
 """
 
 import os
@@ -16,25 +13,33 @@ import uuid
 import torch
 import logging
 import argparse
-import re  # Добавлен import re для KTRU endpoint
+import re
 import subprocess
 import sys
-from typing import List, Dict, Any, Optional, Tuple, Union
+import asyncio
+import glob
+import threading
+import concurrent.futures
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
+from queue import Queue
 
 # Библиотеки для работы с векторной БД
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
 
 # Библиотеки для работы с эмбеддингами и LLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from sentence_transformers import SentenceTransformer
 
 # Для веб-сервера
-from fastapi import FastAPI, HTTPException, Body, Query, Depends
+from fastapi import FastAPI, HTTPException, Body, Query, Depends, BackgroundTasks, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List, Dict, Any, Set
 import uvicorn
 
 # Настройка логгирования
@@ -49,10 +54,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Настройки по умолчанию
-DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large"  # Более надежная мультиязычная модель
-DEFAULT_LLM_MODEL = "ai-forever/mGPT"  # Стабильная русскоязычная модель
+DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+DEFAULT_LLM_MODEL = "ai-forever/mGPT"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_BATCH_SIZE = 100
+DEFAULT_WORKER_THREADS = 4
+
+# Глобальные переменные для мониторинга
+class ServiceStats:
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.documents_processed = 0
+        self.ktru_requests = 0
+        self.successful_ktru = 0
+        self.failed_ktru = 0
+        self.batch_processes = 0
+        self.system_load = {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "gpu": 0.0 if torch.cuda.is_available() else None
+        }
+        # Очередь и результаты для пакетных задач
+        self.batch_jobs = {}
+        self.batch_results = {}
+        self.task_queue = Queue()
+        self.task_results = {}
+        self.lock = threading.Lock()
+
+    def update_system_load(self):
+        """Обновляет информацию о загрузке системы"""
+        try:
+            import psutil
+            self.system_load["cpu"] = psutil.cpu_percent()
+            self.system_load["memory"] = psutil.virtual_memory().percent
+
+            if torch.cuda.is_available():
+                # Получаем информацию о загрузке GPU
+                try:
+                    allocated = torch.cuda.memory_allocated(0)
+                    total = torch.cuda.get_device_properties(0).total_memory
+                    self.system_load["gpu"] = allocated / total * 100
+                except Exception as e:
+                    logger.warning(f"Не удалось получить информацию о GPU: {e}")
+                    self.system_load["gpu"] = 0.0
+        except ImportError:
+            logger.warning("Модуль psutil не установлен, информация о системе недоступна")
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении информации о системе: {e}")
+
+# Создаем глобальный объект статистики
+service_stats = ServiceStats()
 
 # Проверяем и запускаем Qdrant, если он не запущен
 def ensure_qdrant_running():
@@ -100,6 +151,77 @@ def ensure_qdrant_running():
         logger.error(f"Исполняемый файл Qdrant не найден по пути {qdrant_path}")
         return False
 
+class BackgroundTasks:
+    """Класс для управления фоновыми задачами"""
+
+    def __init__(self, num_workers=DEFAULT_WORKER_THREADS):
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
+        self.tasks = {}
+        self.lock = threading.Lock()
+
+    def submit_task(self, task_id, func, *args, **kwargs):
+        """Добавляет задачу в пул на выполнение"""
+        future = self.executor.submit(func, *args, **kwargs)
+        with self.lock:
+            self.tasks[task_id] = {
+                "future": future,
+                "start_time": time.time(),
+                "status": "running"
+            }
+        return task_id
+
+    def get_task_status(self, task_id):
+        """Получает статус задачи"""
+        with self.lock:
+            if task_id not in self.tasks:
+                return None
+
+            task = self.tasks[task_id]
+            future = task["future"]
+
+            if future.done():
+                if future.exception():
+                    status = "failed"
+                    result = str(future.exception())
+                else:
+                    status = "completed"
+                    result = future.result()
+
+                # Обновляем статус задачи
+                if task["status"] != status:
+                    task["status"] = status
+                    task["end_time"] = time.time()
+
+                return {
+                    "task_id": task_id,
+                    "status": status,
+                    "result": result if status == "completed" else None,
+                    "error": result if status == "failed" else None,
+                    "duration": task["end_time"] - task["start_time"]
+                }
+            else:
+                return {
+                    "task_id": task_id,
+                    "status": "running",
+                    "duration": time.time() - task["start_time"]
+                }
+
+    def cleanup_tasks(self, max_age=3600):
+        """Очищает завершенные задачи старше max_age секунд"""
+        current_time = time.time()
+        with self.lock:
+            to_remove = []
+            for task_id, task in self.tasks.items():
+                if task["status"] in ["completed", "failed"]:
+                    if "end_time" in task and current_time - task["end_time"] > max_age:
+                        to_remove.append(task_id)
+
+            for task_id in to_remove:
+                del self.tasks[task_id]
+
+# Создаем экземпляр для управления фоновыми задачами
+background_tasks = BackgroundTasks()
+
 class RAGSystem:
     """
     Основной класс RAG-системы, объединяющий создание эмбеддингов,
@@ -118,21 +240,14 @@ class RAGSystem:
     ):
         """
         Инициализация компонентов RAG-системы
-
-        Args:
-            embedding_model_name: Имя модели для эмбеддингов
-            llm_model_name: Имя модели для генерации ответов
-            qdrant_url: URL Qdrant сервера
-            collection_name: Имя коллекции в Qdrant
-            use_gpu: Использовать ли GPU для инференса
-            load_in_8bit: Загружать ли LLM в 8-битном режиме для экономии памяти
-            vector_size: Размерность векторов эмбеддингов
         """
         # Убедимся, что Qdrant запущен
         ensure_qdrant_running()
 
         self.collection_name = collection_name
         self.vector_size = vector_size
+        self.qdrant_url = qdrant_url
+        self.use_gpu = use_gpu
 
         # Инициализация клиента Qdrant с отключенной проверкой совместимости
         logger.info(f"Подключение к Qdrant по адресу {qdrant_url}")
@@ -157,6 +272,80 @@ class RAGSystem:
             self.llm = None
             self.tokenizer = None
             self.generation_pipeline = None
+
+        # Лок для обеспечения потокобезопасности
+        self._lock = threading.RLock()
+
+        # Кэширование эмбеддингов для оптимизации
+        self.embedding_cache = {}
+        self.embedding_cache_max_size = 10000  # Максимальный размер кэша
+
+        # Счетчики для статистики
+        self.stats = {
+            "documents_total": 0,
+            "documents_with_ktru": 0,
+            "documents_without_ktru": 0,
+            "search_requests": 0,
+            "search_results": 0,
+            "generation_requests": 0,
+            "generation_successes": 0,
+            "generation_failures": 0
+        }
+
+        # Обновляем начальную статистику
+        self._update_stats_from_db()
+
+    def _update_stats_from_db(self):
+        """Обновляет статистику на основе данных из БД"""
+        try:
+            # Получаем общее количество документов
+            collection_info = self.qdrant_client.get_collection(self.collection_name)
+            self.stats["documents_total"] = collection_info.vectors_count
+
+            # Получаем количество документов с КТРУ
+            search_result = self.qdrant_client.count(
+                collection_name=self.collection_name,
+                count_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="ktru_code",
+                            match=MatchValue(value={"$exists": True})
+                        )
+                    ]
+                )
+            )
+            self.stats["documents_with_ktru"] = search_result.count
+
+            # Вычисляем количество документов без КТРУ
+            self.stats["documents_without_ktru"] = self.stats["documents_total"] - self.stats["documents_with_ktru"]
+
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении статистики из БД: {e}")
+
+    def get_stats(self):
+        """Возвращает статистику системы"""
+        # Обновляем текущую статистику
+        self._update_stats_from_db()
+
+        return {
+            "qdrant": {
+                "url": self.qdrant_url,
+                "collection": self.collection_name,
+                "documents_total": self.stats["documents_total"],
+                "documents_with_ktru": self.stats["documents_with_ktru"],
+                "documents_without_ktru": self.stats["documents_without_ktru"],
+            },
+            "embedding_model": str(self.embedding_model),
+            "llm_model": str(self.llm) if self.llm else None,
+            "gpu_enabled": self.use_gpu and torch.cuda.is_available(),
+            "operations": {
+                "search_requests": self.stats["search_requests"],
+                "search_results": self.stats["search_results"],
+                "generation_requests": self.stats["generation_requests"],
+                "generation_successes": self.stats["generation_successes"],
+                "generation_failures": self.stats["generation_failures"]
+            }
+        }
 
     def _ensure_collection_exists(self):
         """
@@ -260,6 +449,20 @@ class RAGSystem:
 
             logger.info(f"Обработано {min(i+batch_size, total_docs)}/{total_docs} документов")
 
+            # Обновляем статистику
+            with self._lock:
+                self.stats["documents_total"] += len(batch)
+
+                # Подсчитываем документы с КТРУ и без
+                docs_with_ktru = sum(1 for doc in batch if doc.get("ktru_code"))
+                self.stats["documents_with_ktru"] += docs_with_ktru
+                self.stats["documents_without_ktru"] += (len(batch) - docs_with_ktru)
+
+                # Обновляем глобальную статистику
+                service_stats.documents_processed += len(batch)
+
+        return {"added": total_docs}
+
     def _prepare_text_from_document(self, doc: Dict[str, Any]) -> str:
         """
         Преобразует документ JSON в текстовое представление для эмбеддинга
@@ -350,6 +553,10 @@ class RAGSystem:
         Returns:
             List[Dict[str, Any]]: Список найденных документов с их метаданными
         """
+        # Обновляем статистику
+        with self._lock:
+            self.stats["search_requests"] += 1
+
         # Создаем эмбеддинг запроса с SentenceTransformer
         query_embedding = self.embedding_model.encode(query, normalize_embeddings=True)
 
@@ -377,6 +584,10 @@ class RAGSystem:
                 **result.payload
             }
             documents.append(doc)
+
+        # Обновляем статистику
+        with self._lock:
+            self.stats["search_results"] += len(documents)
 
         return documents
 
@@ -421,6 +632,17 @@ class RAGSystem:
                             key=key,
                             range=models.Range(lte=op_value)
                         ))
+                    elif op == '$exists':
+                        if op_value:
+                            conditions.append(models.FieldCondition(
+                                key=key,
+                                match=models.MatchAny()
+                            ))
+                        else:
+                            conditions.append(models.FieldCondition(
+                                key=key,
+                                match=models.IsNullCondition(is_null=True)
+                            ))
             # Для атрибутов мы используем поиск по ключам и значениям
             elif key == 'attributes' and isinstance(value, dict):
                 for attr_name, attr_value in value.items():
@@ -456,7 +678,13 @@ class RAGSystem:
         Returns:
             Dict[str, Any]: Ответ с контекстом и сгенерированным текстом
         """
+        # Обновляем статистику
+        with self._lock:
+            self.stats["generation_requests"] += 1
+
         if not self.llm or not self.generation_pipeline:
+            with self._lock:
+                self.stats["generation_failures"] += 1
             raise ValueError("Языковая модель не инициализирована")
 
         # Поиск релевантных документов
@@ -478,9 +706,18 @@ class RAGSystem:
             generated_text = self.generation_pipeline(prompt)[0]['generated_text']
             # Извлечение только сгенерированного ответа, без промпта
             answer = self._extract_answer(generated_text, prompt)
+
+            # Обновляем статистику успешной генерации
+            with self._lock:
+                self.stats["generation_successes"] += 1
+
         except Exception as e:
             logger.error(f"Ошибка при генерации ответа: {e}")
             answer = f"Не удалось сгенерировать ответ: {str(e)}"
+
+            # Обновляем статистику неудачной генерации
+            with self._lock:
+                self.stats["generation_failures"] += 1
 
         return {
             "query": query,
@@ -590,6 +827,490 @@ class RAGSystem:
 
         return answer
 
+    def determine_ktru_code(self, document: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Определяет код КТРУ для одного товара
+
+        Args:
+            document: Документ с информацией о товаре
+
+        Returns:
+            Dict[str, Any]: Результат определения кода КТРУ
+        """
+        # Обновляем статистику
+        service_stats.ktru_requests += 1
+
+        if not self.generation_pipeline:
+            service_stats.failed_ktru += 1
+            raise ValueError("Языковая модель не инициализирована. Невозможно определить код КТРУ.")
+
+        # Формируем промпт специально для задачи определения кода КТРУ
+        prompt = f"""Я предоставлю тебе JSON-файл с описанием товара. Твоя задача - определить единственный точный код КТРУ для этого товара. Если ты не можешь определить код с высокой уверенностью (более 95%), ответь только "код не найден".
+
+## Правила определения:
+1. Анализируй все поля JSON, особое внимание обрати на:
+   - title (полное наименование товара)
+   - description (описание товара)
+   - category и parent_category (категории товара)
+   - attributes (ключевые характеристики)
+   - brand (производитель)
+2. Для корректного определения кода КТРУ обязательно учитывай:
+   - Точное соответствие типа товара
+   - Размеры и технические характеристики
+   - Специфические особенности товара, указанные в описании
+3. Код КТРУ должен иметь формат XX.XX.XX.XXX-XXXXXXXX, где первые цифры соответствуют ОКПД2, а после дефиса - уникальный идентификатор в КТРУ.
+
+## Формат ответа:
+- Если определен один точный код с уверенностью >95%, выведи только этот код КТРУ, без пояснений
+- Если невозможно определить точный код, выведи только фразу "код не найден"
+
+JSON товара:
+{json.dumps(document, ensure_ascii=False)}
+
+Найди наиболее подходящий код КТРУ для этого товара:
+"""
+        # Поиск документов по описанию товара
+        search_query = f"{document.get('title', '')} {document.get('description', '')}"
+        documents = self.search(
+            query=search_query,
+            limit=10  # Увеличиваем количество документов для повышения точности
+        )
+
+        # Форматируем контекст из найденных документов
+        context = self._format_context_from_documents(documents)
+
+        # Генерируем ответ с специальным промптом напрямую через LLM
+        try:
+            generated_text = self.generation_pipeline(prompt + "\nРеференсные данные из каталога КТРУ:\n" + context)[0]['generated_text']
+
+            # Извлекаем только ответ модели
+            answer = self._extract_answer(generated_text, prompt)
+
+            # Проверяем формат ответа
+            if answer.strip() == "код не найден":
+                result = {"result": "код не найден", "confidence": "< 95%"}
+                service_stats.failed_ktru += 1
+            elif re.match(r'\d{2}\.\d{2}\.\d{2}\.\d{3}-\d{8}', answer.strip()):
+                result = {"result": answer.strip(), "confidence": "> 95%"}
+                service_stats.successful_ktru += 1
+            else:
+                result = {"result": "код не найден", "confidence": "< 95%"}
+                service_stats.failed_ktru += 1
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка при определении кода КТРУ: {e}")
+            service_stats.failed_ktru += 1
+            return {"result": "ошибка", "error": str(e), "confidence": "0%"}
+
+    def determine_ktru_codes_batch(self, documents: List[Dict[str, Any]], batch_size: int = 10) -> Dict[str, Any]:
+        """
+        Определяет коды КТРУ для батча товаров
+
+        Args:
+            documents: Список документов с информацией о товарах
+            batch_size: Размер подбатча для параллельной обработки
+
+        Returns:
+            Dict[str, Any]: Результаты определения кодов КТРУ и идентификатор задачи
+        """
+        # Создаем уникальный идентификатор задачи
+        task_id = str(uuid.uuid4())
+
+        # Создаем функцию для выполнения в фоне
+        def process_batch():
+            try:
+                service_stats.batch_processes += 1
+
+                results = []
+                total = len(documents)
+                processed = 0
+
+                logger.info(f"Начало обработки пакетного определения КТРУ для {total} документов (task_id: {task_id})")
+
+                # Обрабатываем документы небольшими группами
+                for i in range(0, total, batch_size):
+                    sub_batch = documents[i:i+batch_size]
+
+                    # Определяем КТРУ для каждого документа в группе
+                    for doc in sub_batch:
+                        doc_id = doc.get("id", str(uuid.uuid4()))
+
+                        # Определяем КТРУ для документа
+                        ktru_result = self.determine_ktru_code(doc)
+
+                        # Добавляем результат в общий список
+                        results.append({
+                            "document_id": doc_id,
+                            "ktru_code": ktru_result.get("result"),
+                            "confidence": ktru_result.get("confidence"),
+                            "original_document": doc
+                        })
+
+                        processed += 1
+
+                    # Обновляем прогресс
+                    logger.info(f"Обработано {processed}/{total} документов для задачи {task_id}")
+
+                # Сохраняем результаты
+                with service_stats.lock:
+                    service_stats.batch_results[task_id] = {
+                        "status": "completed",
+                        "total": total,
+                        "processed": processed,
+                        "results": results,
+                        "completed_at": datetime.now().isoformat()
+                    }
+
+                logger.info(f"Завершена обработка пакетного определения КТРУ для задачи {task_id}")
+                return results
+
+            except Exception as e:
+                logger.error(f"Ошибка при пакетном определении КТРУ (task_id: {task_id}): {e}")
+
+                # Сохраняем информацию об ошибке
+                with service_stats.lock:
+                    service_stats.batch_results[task_id] = {
+                        "status": "failed",
+                        "error": str(e),
+                        "total": len(documents),
+                        "processed": 0,
+                        "completed_at": datetime.now().isoformat()
+                    }
+
+                return {"error": str(e)}
+
+        # Сохраняем информацию о задаче
+        with service_stats.lock:
+            service_stats.batch_jobs[task_id] = {
+                "status": "queued",
+                "total": len(documents),
+                "created_at": datetime.now().isoformat()
+            }
+
+        # Запускаем задачу в фоновом режиме
+        background_tasks.submit_task(task_id, process_batch)
+
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "total_documents": len(documents),
+            "message": "Задача поставлена в очередь на выполнение"
+        }
+
+    def get_batch_task_status(self, task_id: str) -> Dict[str, Any]:
+        """
+        Получает статус выполнения пакетной задачи
+
+        Args:
+            task_id: Идентификатор задачи
+
+        Returns:
+            Dict[str, Any]: Статус задачи
+        """
+        # Проверяем статус задачи
+        with service_stats.lock:
+            # Проверяем, есть ли задача в завершенных
+            if task_id in service_stats.batch_results:
+                result = service_stats.batch_results[task_id]
+
+                # Если задача уже завершена, возвращаем статус и, если нужно, результаты
+                return {
+                    "task_id": task_id,
+                    "status": result["status"],
+                    "total": result["total"],
+                    "processed": result["processed"],
+                    "completed_at": result["completed_at"],
+                    "results_available": True
+                }
+
+            # Проверяем, есть ли задача в активных
+            elif task_id in service_stats.batch_jobs:
+                job = service_stats.batch_jobs[task_id]
+
+                # Задача в процессе выполнения
+                return {
+                    "task_id": task_id,
+                    "status": job["status"],
+                    "total": job["total"],
+                    "created_at": job["created_at"],
+                    "message": "Задача выполняется"
+                }
+
+            # Задача не найдена
+            else:
+                return {
+                    "task_id": task_id,
+                    "status": "not_found",
+                    "message": "Задача не найдена"
+                }
+
+    def get_batch_task_results(self, task_id: str) -> Dict[str, Any]:
+        """
+        Получает результаты выполнения пакетной задачи
+
+        Args:
+            task_id: Идентификатор задачи
+
+        Returns:
+            Dict[str, Any]: Результаты задачи
+        """
+        # Проверяем статус задачи
+        with service_stats.lock:
+            # Проверяем, есть ли задача в завершенных
+            if task_id in service_stats.batch_results:
+                result = service_stats.batch_results[task_id]
+
+                # Если задача завершена успешно, возвращаем результаты
+                if result["status"] == "completed":
+                    return {
+                        "task_id": task_id,
+                        "status": "completed",
+                        "total": result["total"],
+                        "processed": result["processed"],
+                        "completed_at": result["completed_at"],
+                        "results": result["results"]
+                    }
+
+                # Если задача завершена с ошибкой
+                else:
+                    return {
+                        "task_id": task_id,
+                        "status": "failed",
+                        "error": result.get("error", "Неизвестная ошибка"),
+                        "completed_at": result["completed_at"]
+                    }
+
+            # Задача не найдена или не завершена
+            else:
+                status = self.get_batch_task_status(task_id)
+
+                if status["status"] == "not_found":
+                    return {
+                        "task_id": task_id,
+                        "status": "not_found",
+                        "message": "Задача не найдена"
+                    }
+                else:
+                    return {
+                        "task_id": task_id,
+                        "status": status["status"],
+                        "message": "Задача еще не завершена, результаты недоступны"
+                    }
+
+    def cancel_batch_task(self, task_id: str) -> Dict[str, Any]:
+        """
+        Отменяет выполнение пакетной задачи
+
+        Args:
+            task_id: Идентификатор задачи
+
+        Returns:
+            Dict[str, Any]: Результат операции
+        """
+        # Проверяем статус задачи
+        task_status = background_tasks.get_task_status(task_id)
+
+        if not task_status:
+            return {
+                "task_id": task_id,
+                "status": "not_found",
+                "message": "Задача не найдена"
+            }
+
+        # Если задача еще выполняется, пытаемся отменить
+        if task_status["status"] == "running":
+            # К сожалению, нельзя отменить уже запущенную задачу в ThreadPoolExecutor,
+            # но можно пометить её как отмененную, чтобы не обрабатывать результаты
+            with service_stats.lock:
+                if task_id in service_stats.batch_jobs:
+                    service_stats.batch_jobs[task_id]["status"] = "cancelled"
+
+                    # Сохраняем информацию об отмене
+                    service_stats.batch_results[task_id] = {
+                        "status": "cancelled",
+                        "total": service_stats.batch_jobs[task_id]["total"],
+                        "processed": 0,
+                        "completed_at": datetime.now().isoformat(),
+                        "message": "Задача была отменена пользователем"
+                    }
+
+            return {
+                "task_id": task_id,
+                "status": "cancelled",
+                "message": "Задача помечена как отмененная"
+            }
+
+        # Если задача уже завершена
+        else:
+            return {
+                "task_id": task_id,
+                "status": task_status["status"],
+                "message": f"Задача уже в статусе {task_status['status']}, отмена невозможна"
+            }
+
+    def count_documents(self, filter_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Подсчитывает количество документов по заданным критериям
+
+        Args:
+            filter_params: Параметры фильтрации (опционально)
+
+        Returns:
+            Dict[str, Any]: Количество документов
+        """
+        try:
+            # Настраиваем фильтр для подсчета, если он передан
+            count_filter = None
+            if filter_params:
+                count_filter = Filter(
+                    must=self._build_filter_conditions(filter_params)
+                )
+
+            # Выполняем подсчет
+            count_result = self.qdrant_client.count(
+                collection_name=self.collection_name,
+                count_filter=count_filter
+            )
+
+            return {
+                "count": count_result.count
+            }
+
+        except Exception as e:
+            logger.error(f"Ошибка при подсчете документов: {e}")
+            raise ValueError(f"Ошибка при подсчете документов: {e}")
+
+    def cleanup_old_results(self, max_age_hours: int = 24) -> Dict[str, int]:
+        """
+        Очищает старые результаты выполнения пакетных задач
+
+        Args:
+            max_age_hours: Максимальный возраст результатов в часах
+
+        Returns:
+            Dict[str, int]: Количество очищенных результатов
+        """
+        with service_stats.lock:
+            now = datetime.now()
+            to_remove = []
+
+            # Находим старые результаты
+            for task_id, result in service_stats.batch_results.items():
+                if "completed_at" in result:
+                    completed_at = datetime.fromisoformat(result["completed_at"])
+                    age_hours = (now - completed_at).total_seconds() / 3600
+
+                    if age_hours > max_age_hours:
+                        to_remove.append(task_id)
+
+            # Удаляем старые результаты
+            for task_id in to_remove:
+                del service_stats.batch_results[task_id]
+
+            # Также очищаем старые задачи
+            old_jobs = []
+            for task_id, job in service_stats.batch_jobs.items():
+                if "created_at" in job:
+                    created_at = datetime.fromisoformat(job["created_at"])
+                    age_hours = (now - created_at).total_seconds() / 3600
+
+                    if age_hours > max_age_hours:
+                        old_jobs.append(task_id)
+
+            # Удаляем старые задачи
+            for task_id in old_jobs:
+                if task_id in service_stats.batch_jobs:
+                    del service_stats.batch_jobs[task_id]
+
+            return {
+                "removed_results": len(to_remove),
+                "removed_jobs": len(old_jobs)
+            }
+
+    def update_document(self, doc_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Обновляет документ в базе данных
+
+        Args:
+            doc_id: Идентификатор документа
+            update_data: Данные для обновления
+
+        Returns:
+            Dict[str, Any]: Результат операции
+        """
+        try:
+            # Получаем текущий документ
+            search_result = self.qdrant_client.retrieve(
+                collection_name=self.collection_name,
+                ids=[doc_id]
+            )
+
+            if not search_result:
+                return {
+                    "status": "error",
+                    "message": f"Документ с ID {doc_id} не найден"
+                }
+
+            # Получаем текущие данные документа
+            current_doc = search_result[0].payload
+
+            # Обновляем данные
+            updated_doc = {**current_doc, **update_data}
+
+            # Если изменился основной текст документа, нужно пересчитать эмбеддинг
+            recalculate_embedding = (
+                current_doc.get("title") != updated_doc.get("title") or
+                current_doc.get("description") != updated_doc.get("description") or
+                current_doc.get("attributes") != updated_doc.get("attributes")
+            )
+
+            if recalculate_embedding:
+                # Создаем текстовое представление для эмбеддинга
+                text = self._prepare_text_from_document(updated_doc)
+
+                # Генерируем новый эмбеддинг
+                embedding = self.embedding_model.encode(text, normalize_embeddings=True)
+
+                # Обновляем документ вместе с новым эмбеддингом
+                self.qdrant_client.upsert(
+                    collection_name=self.collection_name,
+                    points=[
+                        PointStruct(
+                            id=doc_id,
+                            vector=embedding.tolist(),
+                            payload=self._prepare_payload(updated_doc)
+                        )
+                    ]
+                )
+
+                return {
+                    "status": "success",
+                    "message": f"Документ с ID {doc_id} успешно обновлен с пересчетом эмбеддинга",
+                    "document": updated_doc
+                }
+            else:
+                # Обновляем только метаданные без пересчета эмбеддинга
+                self.qdrant_client.set_payload(
+                    collection_name=self.collection_name,
+                    payload=self._prepare_payload(updated_doc),
+                    points=[doc_id]
+                )
+
+                return {
+                    "status": "success",
+                    "message": f"Метаданные документа с ID {doc_id} успешно обновлены",
+                    "document": updated_doc
+                }
+
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении документа {doc_id}: {e}")
+            return {
+                "status": "error",
+                "message": f"Ошибка при обновлении документа: {str(e)}"
+            }
+
 # Функция для загрузки данных из JSON-файлов
 def load_json_data(file_paths: List[str]) -> List[Dict[str, Any]]:
     """
@@ -644,6 +1365,57 @@ class AddDocumentsRequest(BaseModel):
     documents: List[DocumentBase]
     batch_size: int = DEFAULT_BATCH_SIZE
 
+class KtruCodeRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    attributes: Optional[List[Dict[str, Any]]] = None
+    category: Optional[str] = None
+    parent_category: Optional[str] = None
+    brand: Optional[str] = None
+
+    class Config:
+        extra = "allow"  # Разрешаем дополнительные поля
+
+    def dict(self, *args, **kwargs):
+        result = super().dict(*args, **kwargs)
+        # Удаляем None значения для более чистого JSON
+        return {k: v for k, v in result.items() if v is not None}
+
+class BatchKtruCodeRequest(BaseModel):
+    documents: List[KtruCodeRequest]
+    batch_size: int = 10
+
+    @validator('documents')
+    def validate_documents(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("Список документов не может быть пустым")
+
+        if len(v) > 10000:
+            raise ValueError("Слишком много документов для одного запроса. Максимум 10000.")
+
+        return v
+
+class CountRequest(BaseModel):
+    filter_params: Optional[Dict[str, Any]] = None
+
+class UpdateDocumentRequest(BaseModel):
+    ktru_code: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    unit: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "allow"  # Разрешаем дополнительные поля
+
+    def dict(self, *args, **kwargs):
+        result = super().dict(*args, **kwargs)
+        # Удаляем None значения для более чистого JSON
+        return {k: v for k, v in result.items() if v is not None}
+
+class BatchTaskStatusRequest(BaseModel):
+    task_id: str
+
 # Создание FastAPI-приложения для API
 def create_app(rag_system: RAGSystem):
     """
@@ -656,9 +1428,9 @@ def create_app(rag_system: RAGSystem):
         FastAPI: Экземпляр FastAPI-приложения
     """
     app = FastAPI(
-        title="RAG API для технической документации",
-        description="API для поиска и генерации ответов на основе технической документации",
-        version="1.0.0"
+        title="RAG API для технической документации и определения КТРУ",
+        description="API для поиска, генерации ответов и определения КТРУ кодов для технической документации",
+        version="2.0.0"
     )
 
     # Добавляем CORS middleware
@@ -669,6 +1441,8 @@ def create_app(rag_system: RAGSystem):
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # ============= Основные эндпоинты ===============
 
     @app.post("/api/search", summary="Поиск документов")
     async def search_endpoint(request: SearchRequest = Body(...)):
@@ -708,23 +1482,20 @@ def create_app(rag_system: RAGSystem):
         try:
             # Преобразуем Pydantic модели в словари для обработки
             documents = [doc.dict() for doc in request.documents]
-            rag_system.add_documents(documents, request.batch_size)
+            result = rag_system.add_documents(documents, request.batch_size)
             return {
                 "status": "success",
-                "message": f'Добавлено {len(documents)} документов'
+                "message": f'Добавлено {len(documents)} документов',
+                **result
             }
         except Exception as e:
             logger.error(f"Ошибка при добавлении документов: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # Добавляем эндпоинт для проверки состояния системы
-    @app.get("/health", summary="Проверка работоспособности системы")
-    async def health_check():
-        return {"status": "ok", "version": "1.0.0"}
+    # ============= Эндпоинты для КТРУ ===============
 
-    # Добавляем специальный эндпоинт для определения кода КТРУ
-    @app.post("/api/ktru_code", summary="Определение кода КТРУ по описанию товара")
-    async def ktru_code_endpoint(document: DocumentBase = Body(...)):
+    @app.post("/api/ktru_code", summary="Определение кода КТРУ для одного товара")
+    async def ktru_code_endpoint(document: KtruCodeRequest = Body(...)):
         try:
             if not rag_system.generation_pipeline:
                 raise HTTPException(
@@ -732,57 +1503,170 @@ def create_app(rag_system: RAGSystem):
                     detail="Языковая модель не инициализирована. Невозможно определить код КТРУ."
                 )
 
-            # Формируем промпт специально для задачи определения кода КТРУ
-            prompt = f"""Я предоставлю тебе JSON-файл с описанием товара. Твоя задача - определить единственный точный код КТРУ для этого товара. Если ты не можешь определить код с высокой уверенностью (более 95%), ответь только "код не найден".
-
-## Правила определения:
-1. Анализируй все поля JSON, особое внимание обрати на:
-   - title (полное наименование товара)
-   - description (описание товара)
-   - category и parent_category (категории товара)
-   - attributes (ключевые характеристики)
-   - brand (производитель)
-2. Для корректного определения кода КТРУ обязательно учитывай:
-   - Точное соответствие типа товара
-   - Размеры и технические характеристики
-   - Специфические особенности товара, указанные в описании
-3. Код КТРУ должен иметь формат XX.XX.XX.XXX-XXXXXXXX, где первые цифры соответствуют ОКПД2, а после дефиса - уникальный идентификатор в КТРУ.
-
-## Формат ответа:
-- Если определен один точный код с уверенностью >95%, выведи только этот код КТРУ, без пояснений
-- Если невозможно определить точный код, выведи только фразу "код не найден"
-
-JSON товара:
-{json.dumps(document.dict(), ensure_ascii=False)}
-
-Найди наиболее подходящий код КТРУ для этого товара:
-"""
-            # Поиск документов по описанию товара
-            search_query = f"{document.dict().get('title', '')} {document.dict().get('description', '')}"
-            documents = rag_system.search(
-                query=search_query,
-                limit=10  # Увеличиваем количество документов для повышения точности
-            )
-
-            # Форматируем контекст из найденных документов
-            context = rag_system._format_context_from_documents(documents)
-
-            # Генерируем ответ с специальным промптом напрямую через LLM
-            generated_text = rag_system.generation_pipeline(prompt + "\nРеференсные данные из каталога КТРУ:\n" + context)[0]['generated_text']
-
-            # Извлекаем только ответ модели
-            answer = rag_system._extract_answer(generated_text, prompt)
-
-            # Проверяем формат ответа
-            if answer.strip() == "код не найден":
-                return {"result": "код не найден", "confidence": "< 95%"}
-            elif re.match(r'\d{2}\.\d{2}\.\d{2}\.\d{3}-\d{8}', answer.strip()):
-                return {"result": answer.strip(), "confidence": "> 95%"}
-            else:
-                return {"result": "код не найден", "confidence": "< 95%"}
+            result = rag_system.determine_ktru_code(document.dict())
+            return result
 
         except Exception as e:
             logger.error(f"Ошибка при определении кода КТРУ: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/ktru_code/batch", summary="Определение кодов КТРУ для батча товаров")
+    async def ktru_code_batch_endpoint(request: BatchKtruCodeRequest = Body(...)):
+        try:
+            if not rag_system.generation_pipeline:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Языковая модель не инициализирована. Невозможно определить коды КТРУ."
+                )
+
+            # Преобразуем Pydantic модели в словари
+            documents = [doc.dict() for doc in request.documents]
+
+            # Запускаем пакетную обработку
+            result = rag_system.determine_ktru_codes_batch(documents, request.batch_size)
+
+            # Возвращаем идентификатор задачи
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка при пакетном определении кодов КТРУ: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/ktru_code/batch/{task_id}/status", summary="Получение статуса выполнения пакетной задачи определения КТРУ")
+    async def ktru_code_batch_status_endpoint(task_id: str):
+        try:
+            result = rag_system.get_batch_task_status(task_id)
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении статуса пакетной задачи определения КТРУ: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/ktru_code/batch/{task_id}/results", summary="Получение результатов выполнения пакетной задачи определения КТРУ")
+    async def ktru_code_batch_results_endpoint(task_id: str):
+        try:
+            result = rag_system.get_batch_task_results(task_id)
+
+            # Если задача не завершена или не найдена, возвращаем ошибку
+            if result["status"] not in ["completed", "failed"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Результаты недоступны. Статус задачи: {result['status']}"
+                )
+
+            return result
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Ошибка при получении результатов пакетной задачи определения КТРУ: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/ktru_code/batch/{task_id}/cancel", summary="Отмена выполнения пакетной задачи определения КТРУ")
+    async def ktru_code_batch_cancel_endpoint(task_id: str):
+        try:
+            result = rag_system.cancel_batch_task(task_id)
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка при отмене пакетной задачи определения КТРУ: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ============= Эндпоинты для документов ===============
+
+    @app.post("/api/documents/count", summary="Подсчет количества документов")
+    async def count_documents_endpoint(request: CountRequest = Body(...)):
+        try:
+            result = rag_system.count_documents(request.filter_params)
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка при подсчете документов: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.put("/api/documents/{doc_id}", summary="Обновление документа")
+    async def update_document_endpoint(doc_id: str, request: UpdateDocumentRequest = Body(...)):
+        try:
+            result = rag_system.update_document(doc_id, request.dict())
+
+            if result["status"] == "error":
+                raise HTTPException(
+                    status_code=400,
+                    detail=result["message"]
+                )
+
+            return result
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении документа: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ============= Эндпоинты для мониторинга ===============
+
+    @app.get("/health", summary="Проверка работоспособности системы")
+    async def health_check():
+        # Обновляем информацию о загрузке системы
+        service_stats.update_system_load()
+
+        return {
+            "status": "ok",
+            "version": "2.0.0",
+            "uptime": str(datetime.now() - service_stats.start_time),
+            "system_load": service_stats.system_load,
+            "documents_processed": service_stats.documents_processed,
+            "ktru_requests": service_stats.ktru_requests,
+            "successful_ktru": service_stats.successful_ktru,
+            "failed_ktru": service_stats.failed_ktru,
+            "batch_processes": service_stats.batch_processes,
+            "active_batch_jobs": len(service_stats.batch_jobs)
+        }
+
+    @app.get("/stats", summary="Получение статистики системы")
+    async def get_stats():
+        # Получаем статистику Qdrant и других компонентов
+        system_stats = rag_system.get_stats()
+
+        # Дополняем глобальной статистикой
+        system_stats["service"] = {
+            "uptime": str(datetime.now() - service_stats.start_time),
+            "documents_processed": service_stats.documents_processed,
+            "ktru_requests": service_stats.ktru_requests,
+            "successful_ktru": service_stats.successful_ktru,
+            "failed_ktru": service_stats.failed_ktru,
+            "batch_processes": service_stats.batch_processes,
+            "active_batch_jobs": len(service_stats.batch_jobs),
+            "completed_batch_jobs": len(service_stats.batch_results)
+        }
+
+        # Обновляем информацию о загрузке системы
+        service_stats.update_system_load()
+        system_stats["system_load"] = service_stats.system_load
+
+        return system_stats
+
+    @app.get("/stats/tasks", summary="Получение списка активных пакетных задач")
+    async def get_active_tasks():
+        with service_stats.lock:
+            active_tasks = {}
+            for task_id, job in service_stats.batch_jobs.items():
+                if job["status"] == "queued" or job["status"] == "running":
+                    active_tasks[task_id] = job
+
+            return {
+                "active_tasks_count": len(active_tasks),
+                "tasks": active_tasks
+            }
+
+    @app.post("/maintenance/cleanup", summary="Очистка старых результатов пакетных задач")
+    async def cleanup_old_results(max_age_hours: int = Query(24, description="Максимальный возраст результатов в часах")):
+        try:
+            result = rag_system.cleanup_old_results(max_age_hours)
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка при очистке старых результатов: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     return app
@@ -797,6 +1681,7 @@ def check_dependencies():
         "uvicorn": "0.23.0",
         "torch": "2.1.0",
         "transformers": "4.37.2",
+        "psutil": "5.9.0"  # Для мониторинга системы
     }
 
     try:
@@ -847,6 +1732,8 @@ def main():
                        help='Порт для запуска API (по умолчанию: 8000)')
     parser.add_argument('--host', type=str, default="0.0.0.0",
                        help='Хост для запуска API (по умолчанию: 0.0.0.0)')
+    parser.add_argument('--worker-threads', type=int, default=DEFAULT_WORKER_THREADS,
+                       help=f'Количество рабочих потоков для пакетной обработки (по умолчанию: {DEFAULT_WORKER_THREADS})')
 
     args = parser.parse_args()
 
@@ -860,6 +1747,10 @@ def main():
             use_gpu=args.use_gpu,
             load_in_8bit=not args.no_8bit
         )
+
+        # Инициализация фоновых задач с нужным количеством потоков
+        global background_tasks
+        background_tasks = BackgroundTasks(num_workers=args.worker_threads)
 
         # Импорт данных из параметров командной строки
         data_files = []

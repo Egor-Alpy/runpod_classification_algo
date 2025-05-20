@@ -4,6 +4,7 @@ services:
   # Сервис Qdrant - векторная база данных
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: qdrant-service
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -14,27 +15,37 @@ services:
     environment:
       - QDRANT_ALLOW_CORS=true
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 4G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/readiness"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
 
   # Сервис RAG-системы
-  rag-service:
+  rag-system:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: rag-system-service
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
+      - model_cache:/app/cache
     environment:
       - QDRANT_URL=http://qdrant:6333
       - COLLECTION_NAME=technical_documents
       - BATCH_SIZE=100
       - USE_GPU=true
       - LOAD_8BIT=true
+      - WORKER_THREADS=4
+      - PYTHONUNBUFFERED=1
     deploy:
       resources:
         reservations:
@@ -42,15 +53,61 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+        limits:
+          memory: 16G
     networks:
       - rag-network
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_healthy
     restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 1m
+      timeout: 30s
+      retries: 3
+      start_period: 2m
+
+  # Мониторинг системы
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - rag-network
+    restart: always
+    depends_on:
+      - rag-system
+
+  # Визуализация мониторинга
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    networks:
+      - rag-network
+    restart: always
+    depends_on:
+      - prometheus
 
 networks:
   rag-network:
-    driver: bridge
-
-volumes:
-  qdrant_data:
