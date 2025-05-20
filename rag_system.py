@@ -93,12 +93,12 @@ class RAGSystem:
         logger.info(f"Загрузка модели эмбеддингов: {embedding_model_name}")
 
         # Используем FastEmbed для оптимизированной генерации эмбеддингов
-        self.embedding_model = TextEmbedding(
-            model_name=embedding_model_name,
-            max_length=512,
-            # Используем CUDA, если доступен GPU
-            providers=["CUDAExecutionProvider"] if use_gpu and torch.cuda.is_available() else ["CPUExecutionProvider"]
-        )
+        from sentence_transformers import SentenceTransformer
+
+        # Инициализируем SentenceTransformer вместо FastEmbed
+        self.embedding_model = SentenceTransformer(embedding_model_name)
+        if use_gpu and torch.cuda.is_available():
+            self.embedding_model = self.embedding_model.to(torch.device("cuda"))
 
         # Инициализация LLM для генерации ответов
         if llm_model_name:
