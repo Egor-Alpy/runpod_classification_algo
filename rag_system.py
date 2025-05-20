@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Настройки по умолчанию
 DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-DEFAULT_LLM_MODEL = "IlyaGusev/saiga_mistral_7b_qlora"
+DEFAULT_LLM_MODEL = "IlyaGusev/saiga_mistral_7b_lora"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_BATCH_SIZE = 100
 
