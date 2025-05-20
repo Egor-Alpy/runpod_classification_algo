@@ -36,7 +36,24 @@ check_and_start_qdrant() {
   fi
 }
 
-# Функция проверки необходимых зависимостей
+# Функция поиска JSON-файлов для импорта
+find_json_files() {
+  echo "Поиск JSON-файлов для импорта..."
+
+  # Создаем директорию data, если она не существует
+  mkdir -p data
+
+  # Ищем все JSON-файлы в текущей директории и директории data
+  JSON_FILES=$(find . -name "*.json" -not -path "./node_modules/*" | tr '\n' ' ')
+
+  if [ -n "$JSON_FILES" ]; then
+    echo "Найдены JSON-файлы для импорта: $JSON_FILES"
+    IMPORT_ARGS="--import-data $JSON_FILES"
+  else
+    echo "JSON-файлы для импорта не найдены"
+    IMPORT_ARGS=""
+  fi
+}
 check_dependencies() {
   echo "Проверка Python-зависимостей..."
 
@@ -63,9 +80,12 @@ main() {
   # Проверяем и запускаем Qdrant
   check_and_start_qdrant
 
+  # Ищем JSON-файлы для импорта
+  find_json_files
+
   # Запускаем RAG-систему
   echo "Запуск RAG-системы..."
-  python3 rag_system.py "$@"
+  python3 rag_system.py $IMPORT_ARGS "$@"
 }
 
 # Запускаем главную функцию с передачей всех аргументов командной строки

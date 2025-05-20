@@ -861,9 +861,26 @@ def main():
             load_in_8bit=not args.no_8bit
         )
 
-        # Импорт данных, если указаны пути к файлам
+        # Импорт данных из параметров командной строки
+        data_files = []
+
+        # Если указаны пути к файлам в аргументах
         if args.import_data:
-            documents = load_json_data(args.import_data)
+            data_files.extend(args.import_data)
+
+        # Автоматический поиск JSON-файлов в директории data
+        if os.path.exists('data'):
+            logger.info("Сканирование директории data на наличие JSON-файлов...")
+            import glob
+            json_files = glob.glob('data/**/*.json', recursive=True)
+            if json_files:
+                logger.info(f"Найдено {len(json_files)} JSON-файлов в директории data")
+                data_files.extend(json_files)
+
+        # Загрузка и импорт данных
+        if data_files:
+            logger.info(f"Загрузка данных из {len(data_files)} файлов")
+            documents = load_json_data(data_files)
             if documents:
                 logger.info(f"Импорт {len(documents)} документов в Qdrant")
                 rag_system.add_documents(documents, args.batch_size)
