@@ -16,6 +16,9 @@ import uuid
 import torch
 import logging
 import argparse
+import re  # Добавлен import re для KTRU endpoint
+import subprocess
+import sys
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 # Библиотеки для работы с векторной БД
@@ -25,7 +28,7 @@ from qdrant_client.http.models import Distance, VectorParams, PointStruct
 
 # Библиотеки для работы с эмбеддингами и LLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from fastembed import TextEmbedding
+from sentence_transformers import SentenceTransformer
 
 # Для веб-сервера
 from fastapi import FastAPI, HTTPException, Body, Query, Depends
@@ -46,10 +49,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Настройки по умолчанию
-DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-DEFAULT_LLM_MODEL = "IlyaGusev/saiga_mistral_7b_lora"
+DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large"  # Более надежная мультиязычная модель
+DEFAULT_LLM_MODEL = "ai-forever/mGPT"  # Стабильная русскоязычная модель
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_BATCH_SIZE = 100
+
+# Проверяем и запускаем Qdrant, если он не запущен
+def ensure_qdrant_running():
+    """Проверяет, запущен ли Qdrant, и запускает его при необходимости"""
+    import socket
+    import subprocess
+    import time
+    import os
+
+    # Проверяем, открыт ли порт 6333
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(('localhost', 6333))
+    sock.close()
+
+    if result == 0:
+        logger.info("Qdrant уже запущен на порту 6333")
+        return True
+
+    logger.info("Qdrant не запущен. Пытаемся запустить...")
+
+    # Проверяем наличие исполняемого файла qdrant
+    qdrant_path = "./qdrant"
+    if os.path.isfile(qdrant_path) and os.access(qdrant_path, os.X_OK):
+        try:
+            # Запускаем Qdrant в фоновом режиме
+            subprocess.Popen([qdrant_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # Ждем запуска
+            max_attempts = 10
+            for i in range(max_attempts):
+                time.sleep(2)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(('localhost', 6333))
+                sock.close()
+                if result == 0:
+                    logger.info(f"Qdrant успешно запущен после {i+1} попыток")
+                    return True
+
+            logger.error(f"Qdrant не запустился после {max_attempts} попыток")
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка при запуске Qdrant: {e}")
+            return False
+    else:
+        logger.error(f"Исполняемый файл Qdrant не найден по пути {qdrant_path}")
+        return False
 
 class RAGSystem:
     """
@@ -65,7 +114,7 @@ class RAGSystem:
         collection_name: str = "technical_documents",
         use_gpu: bool = True,
         load_in_8bit: bool = True,
-        vector_size: int = 1024,  # Размерность для BGE-large
+        vector_size: int = 1024,  # Размерность для моделей E5
     ):
         """
         Инициализация компонентов RAG-системы
@@ -79,12 +128,15 @@ class RAGSystem:
             load_in_8bit: Загружать ли LLM в 8-битном режиме для экономии памяти
             vector_size: Размерность векторов эмбеддингов
         """
+        # Убедимся, что Qdrant запущен
+        ensure_qdrant_running()
+
         self.collection_name = collection_name
         self.vector_size = vector_size
 
-        # Инициализация клиента Qdrant
+        # Инициализация клиента Qdrant с отключенной проверкой совместимости
         logger.info(f"Подключение к Qdrant по адресу {qdrant_url}")
-        self.qdrant_client = QdrantClient(url=qdrant_url)
+        self.qdrant_client = QdrantClient(url=qdrant_url, check_compatibility=False)
 
         # Создание коллекции, если её еще нет
         self._ensure_collection_exists()
@@ -92,13 +144,9 @@ class RAGSystem:
         # Инициализация модели эмбеддингов
         logger.info(f"Загрузка модели эмбеддингов: {embedding_model_name}")
 
-        # Используем FastEmbed для оптимизированной генерации эмбеддингов
-        from sentence_transformers import SentenceTransformer
-
-        # Инициализируем SentenceTransformer вместо FastEmbed
-        self.embedding_model = SentenceTransformer(embedding_model_name)
-        if use_gpu and torch.cuda.is_available():
-            self.embedding_model = self.embedding_model.to(torch.device("cuda"))
+        # Инициализируем SentenceTransformer с явным указанием устройства
+        device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+        self.embedding_model = SentenceTransformer(embedding_model_name, device=device)
 
         # Инициализация LLM для генерации ответов
         if llm_model_name:
@@ -135,32 +183,40 @@ class RAGSystem:
         """
         Инициализирует языковую модель для генерации ответов
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-        # Опции загрузки модели
-        model_kwargs = {}
-        if use_gpu and torch.cuda.is_available():
-            model_kwargs["device_map"] = "auto"
-            model_kwargs["torch_dtype"] = torch.float16
-            if load_in_8bit:
-                model_kwargs["load_in_8bit"] = True
+            # Опции загрузки модели
+            model_kwargs = {}
+            if use_gpu and torch.cuda.is_available():
+                model_kwargs["device_map"] = "auto"
+                model_kwargs["torch_dtype"] = torch.float16
+                if load_in_8bit:
+                    model_kwargs["load_in_8bit"] = True
 
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            **model_kwargs
-        )
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                **model_kwargs
+            )
 
-        # Создание пайплайна для генерации текста
-        self.generation_pipeline = pipeline(
-            "text-generation",
-            model=self.llm,
-            tokenizer=self.tokenizer,
-            max_new_tokens=1024,
-            temperature=0.3,
-            top_p=0.95,
-            repetition_penalty=1.15,
-            do_sample=True
-        )
+            # Создание пайплайна для генерации текста
+            self.generation_pipeline = pipeline(
+                "text-generation",
+                model=self.llm,
+                tokenizer=self.tokenizer,
+                max_new_tokens=1024,
+                temperature=0.3,
+                top_p=0.95,
+                repetition_penalty=1.15,
+                do_sample=True
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации языковой модели: {e}")
+            # Продолжаем работу без генерации ответов
+            self.llm = None
+            self.tokenizer = None
+            self.generation_pipeline = None
+            logger.warning("Система будет работать только в режиме поиска без генерации ответов")
 
     def add_documents(self, documents: List[Dict[str, Any]], batch_size: int = DEFAULT_BATCH_SIZE):
         """
@@ -181,8 +237,8 @@ class RAGSystem:
                 # Создаем текстовое представление документа для эмбеддинга
                 text = self._prepare_text_from_document(doc)
 
-                # Генерируем эмбеддинг
-                embedding = next(self.embedding_model.embed([text]))
+                # Генерируем эмбеддинг с помощью SentenceTransformer
+                embedding = self.embedding_model.encode(text, normalize_embeddings=True)
 
                 # Создаем уникальный ID, если его нет
                 doc_id = str(doc.get("_id", {}).get("$oid", uuid.uuid4()))
@@ -294,8 +350,8 @@ class RAGSystem:
         Returns:
             List[Dict[str, Any]]: Список найденных документов с их метаданными
         """
-        # Создаем эмбеддинг запроса
-        query_embedding = next(self.embedding_model.embed([query]))
+        # Создаем эмбеддинг запроса с SentenceTransformer
+        query_embedding = self.embedding_model.encode(query, normalize_embeddings=True)
 
         # Настраиваем фильтр для поиска, если он передан
         search_filter = None
@@ -400,7 +456,7 @@ class RAGSystem:
         Returns:
             Dict[str, Any]: Ответ с контекстом и сгенерированным текстом
         """
-        if not self.llm:
+        if not self.llm or not self.generation_pipeline:
             raise ValueError("Языковая модель не инициализирована")
 
         # Поиск релевантных документов
@@ -418,10 +474,13 @@ class RAGSystem:
         prompt = self._create_prompt(query, context)
 
         # Генерация ответа
-        generated_text = self.generation_pipeline(prompt)[0]['generated_text']
-
-        # Извлечение только сгенерированного ответа, без промпта
-        answer = self._extract_answer(generated_text, prompt)
+        try:
+            generated_text = self.generation_pipeline(prompt)[0]['generated_text']
+            # Извлечение только сгенерированного ответа, без промпта
+            answer = self._extract_answer(generated_text, prompt)
+        except Exception as e:
+            logger.error(f"Ошибка при генерации ответа: {e}")
+            answer = f"Не удалось сгенерировать ответ: {str(e)}"
 
         return {
             "query": query,
@@ -493,16 +552,17 @@ class RAGSystem:
         Returns:
             str: Готовый промпт
         """
-        # Формат промпта оптимизирован для моделей семейства Saiga
-        prompt = f"""<s>[INST] Ты - ассистент по технической документации и каталогам товаров. 
+        # Универсальный формат промпта, который подойдет для разных моделей
+        prompt = f"""Ты - ассистент по технической документации и каталогам товаров. 
 Используй предоставленную информацию, чтобы ответить на вопрос.
 Если ты не можешь найти ответ в контексте, так и скажи.
 
 Контекст:
 {context}
 
-Вопрос: {query} [/INST]
+Вопрос: {query}
 
+Ответ:
 """
         return prompt
 
@@ -521,8 +581,8 @@ class RAGSystem:
         if generated_text.startswith(prompt):
             answer = generated_text[len(prompt):].strip()
         else:
-            # Если формат ответа другой, ищем ответ после [/INST]
-            parts = generated_text.split('[/INST]')
+            # Ищем ответ после "Ответ:" или возвращаем весь текст
+            parts = generated_text.split("Ответ:")
             if len(parts) > 1:
                 answer = parts[1].strip()
             else:
@@ -626,6 +686,12 @@ def create_app(rag_system: RAGSystem):
     @app.post("/api/generate", summary="Генерация ответа на основе документов")
     async def generate_endpoint(request: GenerateRequest = Body(...)):
         try:
+            if not rag_system.generation_pipeline:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Языковая модель не инициализирована. Возможен только поиск, но не генерация ответов."
+                )
+
             response = rag_system.generate_response(
                 query=request.query,
                 temporal_data=request.temporal_data.dict() if request.temporal_data else None,
@@ -660,8 +726,14 @@ def create_app(rag_system: RAGSystem):
     @app.post("/api/ktru_code", summary="Определение кода КТРУ по описанию товара")
     async def ktru_code_endpoint(document: DocumentBase = Body(...)):
         try:
+            if not rag_system.generation_pipeline:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Языковая модель не инициализирована. Невозможно определить код КТРУ."
+                )
+
             # Формируем промпт специально для задачи определения кода КТРУ
-            prompt = f"""<s>[INST] Я предоставлю тебе JSON-файл с описанием товара. Твоя задача - определить единственный точный код КТРУ для этого товара. Если ты не можешь определить код с высокой уверенностью (более 95%), ответь только "код не найден".
+            prompt = f"""Я предоставлю тебе JSON-файл с описанием товара. Твоя задача - определить единственный точный код КТРУ для этого товара. Если ты не можешь определить код с высокой уверенностью (более 95%), ответь только "код не найден".
 
 ## Правила определения:
 1. Анализируй все поля JSON, особое внимание обрати на:
@@ -681,10 +753,9 @@ def create_app(rag_system: RAGSystem):
 - Если невозможно определить точный код, выведи только фразу "код не найден"
 
 JSON товара:
-{document.json()}
+{json.dumps(document.dict(), ensure_ascii=False)}
 
-Найди наиболее подходящий код КТРУ для этого товара: [/INST]
-
+Найди наиболее подходящий код КТРУ для этого товара:
 """
             # Поиск документов по описанию товара
             search_query = f"{document.dict().get('title', '')} {document.dict().get('description', '')}"
@@ -716,8 +787,45 @@ JSON товара:
 
     return app
 
+# Функция для проверки зависимостей
+def check_dependencies():
+    """Проверяет наличие необходимых зависимостей и при необходимости устанавливает их"""
+    required_packages = {
+        "sentence-transformers": "2.2.2",
+        "qdrant-client": "1.5.0",
+        "fastapi": "0.100.0",
+        "uvicorn": "0.23.0",
+        "torch": "2.1.0",
+        "transformers": "4.37.2",
+    }
+
+    try:
+        import pkg_resources
+        installed = {pkg.key: pkg.version for pkg in pkg_resources.working_set}
+        missing = []
+
+        for package, min_version in required_packages.items():
+            if package not in installed:
+                missing.append(f"{package}>={min_version}")
+
+        if missing:
+            logger.warning(f"Отсутствуют необходимые пакеты: {', '.join(missing)}")
+            logger.info("Установка отсутствующих пакетов...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+            logger.info("Пакеты успешно установлены")
+
+    except Exception as e:
+        logger.error(f"Ошибка при проверке зависимостей: {e}")
+        logger.warning("Продолжение работы с имеющимися пакетами")
+
 # Основная функция для запуска системы
 def main():
+    # Проверяем зависимости
+    check_dependencies()
+
+    # Запускаем Qdrant, если он не запущен
+    ensure_qdrant_running()
+
     parser = argparse.ArgumentParser(description='RAG-система для работы с технической документацией')
     parser.add_argument('--embedding-model', type=str, default=DEFAULT_EMBEDDING_MODEL,
                        help=f'Модель для эмбеддингов (по умолчанию: {DEFAULT_EMBEDDING_MODEL})')
@@ -743,28 +851,35 @@ def main():
     args = parser.parse_args()
 
     # Инициализация RAG-системы
-    rag_system = RAGSystem(
-        embedding_model_name=args.embedding_model,
-        llm_model_name=args.llm_model,
-        qdrant_url=args.qdrant_url,
-        collection_name=args.collection_name,
-        use_gpu=args.use_gpu,
-        load_in_8bit=not args.no_8bit
-    )
+    try:
+        rag_system = RAGSystem(
+            embedding_model_name=args.embedding_model,
+            llm_model_name=args.llm_model,
+            qdrant_url=args.qdrant_url,
+            collection_name=args.collection_name,
+            use_gpu=args.use_gpu,
+            load_in_8bit=not args.no_8bit
+        )
 
-    # Импорт данных, если указаны пути к файлам
-    if args.import_data:
-        documents = load_json_data(args.import_data)
-        if documents:
-            logger.info(f"Импорт {len(documents)} документов в Qdrant")
-            rag_system.add_documents(documents, args.batch_size)
+        # Импорт данных, если указаны пути к файлам
+        if args.import_data:
+            documents = load_json_data(args.import_data)
+            if documents:
+                logger.info(f"Импорт {len(documents)} документов в Qdrant")
+                rag_system.add_documents(documents, args.batch_size)
 
-    # Создание и запуск FastAPI-приложения
-    app = create_app(rag_system)
+        # Создание и запуск FastAPI-приложения
+        app = create_app(rag_system)
 
-    # Запускаем с помощью Uvicorn
-    logger.info(f"Запуск сервера на {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port)
+        # Запускаем с помощью Uvicorn
+        logger.info(f"Запуск сервера на {args.host}:{args.port}")
+        uvicorn.run(app, host=args.host, port=args.port)
+
+    except Exception as e:
+        logger.error(f"Ошибка при запуске системы: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
