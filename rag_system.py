@@ -51,7 +51,6 @@ DEFAULT_LLM_MODEL = "IlyaGusev/saiga_mistral_7b_qlora"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_BATCH_SIZE = 100
 
-
 class RAGSystem:
     """
     Основной класс RAG-системы, объединяющий создание эмбеддингов,
@@ -59,14 +58,14 @@ class RAGSystem:
     """
 
     def __init__(
-            self,
-            embedding_model_name: str = DEFAULT_EMBEDDING_MODEL,
-            llm_model_name: str = DEFAULT_LLM_MODEL,
-            qdrant_url: str = DEFAULT_QDRANT_URL,
-            collection_name: str = "technical_documents",
-            use_gpu: bool = True,
-            load_in_8bit: bool = True,
-            vector_size: int = 1024,  # Размерность для BGE-large
+        self,
+        embedding_model_name: str = DEFAULT_EMBEDDING_MODEL,
+        llm_model_name: str = DEFAULT_LLM_MODEL,
+        qdrant_url: str = DEFAULT_QDRANT_URL,
+        collection_name: str = "technical_documents",
+        use_gpu: bool = True,
+        load_in_8bit: bool = True,
+        vector_size: int = 1024,  # Размерность для BGE-large
     ):
         """
         Инициализация компонентов RAG-системы
@@ -175,7 +174,7 @@ class RAGSystem:
         logger.info(f"Начало обработки {total_docs} документов")
 
         for i in range(0, total_docs, batch_size):
-            batch = documents[i:i + batch_size]
+            batch = documents[i:i+batch_size]
             batch_points = []
 
             for doc in batch:
@@ -203,7 +202,7 @@ class RAGSystem:
                 points=batch_points
             )
 
-            logger.info(f"Обработано {min(i + batch_size, total_docs)}/{total_docs} документов")
+            logger.info(f"Обработано {min(i+batch_size, total_docs)}/{total_docs} документов")
 
     def _prepare_text_from_document(self, doc: Dict[str, Any]) -> str:
         """
@@ -279,10 +278,10 @@ class RAGSystem:
         return payload
 
     def search(
-            self,
-            query: str,
-            filter_params: Optional[Dict[str, Any]] = None,
-            limit: int = 5
+        self,
+        query: str,
+        filter_params: Optional[Dict[str, Any]] = None,
+        limit: int = 5
     ) -> List[Dict[str, Any]]:
         """
         Поиск релевантных документов по запросу
@@ -383,11 +382,11 @@ class RAGSystem:
         return conditions
 
     def generate_response(
-            self,
-            query: str,
-            temporal_data: Optional[Dict[str, Any]] = None,
-            filter_params: Optional[Dict[str, Any]] = None,
-            num_documents: int = 5
+        self,
+        query: str,
+        temporal_data: Optional[Dict[str, Any]] = None,
+        filter_params: Optional[Dict[str, Any]] = None,
+        num_documents: int = 5
     ) -> Dict[str, Any]:
         """
         Генерирует ответ на запрос, используя RAG
@@ -444,7 +443,7 @@ class RAGSystem:
         context = ""
 
         for i, doc in enumerate(documents):
-            context += f"Документ {i + 1}:\n"
+            context += f"Документ {i+1}:\n"
             context += f"Код КТРУ: {doc.get('ktru_code', '')}\n"
             context += f"Название: {doc.get('title', '')}\n"
 
@@ -531,7 +530,6 @@ class RAGSystem:
 
         return answer
 
-
 # Функция для загрузки данных из JSON-файлов
 def load_json_data(file_paths: List[str]) -> List[Dict[str, Any]]:
     """
@@ -562,18 +560,15 @@ def load_json_data(file_paths: List[str]) -> List[Dict[str, Any]]:
 
     return all_documents
 
-
 # Определение Pydantic моделей для валидации данных
 class SearchRequest(BaseModel):
     query: str
     filter_params: Optional[Dict[str, Any]] = None
     limit: int = 5
 
-
 class TemporalData(BaseModel):
     class Config:
         extra = "allow"  # Разрешаем дополнительные поля
-
 
 class GenerateRequest(BaseModel):
     query: str
@@ -581,16 +576,13 @@ class GenerateRequest(BaseModel):
     filter_params: Optional[Dict[str, Any]] = None
     num_documents: int = 5
 
-
 class DocumentBase(BaseModel):
     class Config:
         extra = "allow"  # Разрешаем произвольную структуру JSON
 
-
 class AddDocumentsRequest(BaseModel):
     documents: List[DocumentBase]
     batch_size: int = DEFAULT_BATCH_SIZE
-
 
 # Создание FastAPI-приложения для API
 def create_app(rag_system: RAGSystem):
@@ -705,9 +697,7 @@ JSON товара:
             context = rag_system._format_context_from_documents(documents)
 
             # Генерируем ответ с специальным промптом напрямую через LLM
-            generated_text = \
-            rag_system.generation_pipeline(prompt + "\nРеференсные данные из каталога КТРУ:\n" + context)[0][
-                'generated_text']
+            generated_text = rag_system.generation_pipeline(prompt + "\nРеференсные данные из каталога КТРУ:\n" + context)[0]['generated_text']
 
             # Извлекаем только ответ модели
             answer = rag_system._extract_answer(generated_text, prompt)
@@ -726,30 +716,29 @@ JSON товара:
 
     return app
 
-
 # Основная функция для запуска системы
 def main():
     parser = argparse.ArgumentParser(description='RAG-система для работы с технической документацией')
     parser.add_argument('--embedding-model', type=str, default=DEFAULT_EMBEDDING_MODEL,
-                        help=f'Модель для эмбеддингов (по умолчанию: {DEFAULT_EMBEDDING_MODEL})')
+                       help=f'Модель для эмбеддингов (по умолчанию: {DEFAULT_EMBEDDING_MODEL})')
     parser.add_argument('--llm-model', type=str, default=DEFAULT_LLM_MODEL,
-                        help=f'Модель для генерации ответов (по умолчанию: {DEFAULT_LLM_MODEL})')
+                       help=f'Модель для генерации ответов (по умолчанию: {DEFAULT_LLM_MODEL})')
     parser.add_argument('--qdrant-url', type=str, default=DEFAULT_QDRANT_URL,
-                        help=f'URL Qdrant сервера (по умолчанию: {DEFAULT_QDRANT_URL})')
+                       help=f'URL Qdrant сервера (по умолчанию: {DEFAULT_QDRANT_URL})')
     parser.add_argument('--collection-name', type=str, default='technical_documents',
-                        help='Имя коллекции в Qdrant (по умолчанию: technical_documents)')
+                       help='Имя коллекции в Qdrant (по умолчанию: technical_documents)')
     parser.add_argument('--use-gpu', action='store_true',
-                        help='Использовать GPU для инференса')
+                       help='Использовать GPU для инференса')
     parser.add_argument('--no-8bit', action='store_true',
-                        help='Не использовать 8-битную квантизацию для LLM')
+                       help='Не использовать 8-битную квантизацию для LLM')
     parser.add_argument('--import-data', type=str, nargs='+',
-                        help='Пути к JSON-файлам для импорта (опционально)')
+                       help='Пути к JSON-файлам для импорта (опционально)')
     parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE,
-                        help=f'Размер пакета для вставки (по умолчанию: {DEFAULT_BATCH_SIZE})')
+                       help=f'Размер пакета для вставки (по умолчанию: {DEFAULT_BATCH_SIZE})')
     parser.add_argument('--port', type=int, default=8000,
-                        help='Порт для запуска API (по умолчанию: 8000)')
+                       help='Порт для запуска API (по умолчанию: 8000)')
     parser.add_argument('--host', type=str, default="0.0.0.0",
-                        help='Хост для запуска API (по умолчанию: 0.0.0.0)')
+                       help='Хост для запуска API (по умолчанию: 0.0.0.0)')
 
     args = parser.parse_args()
 
@@ -776,7 +765,6 @@ def main():
     # Запускаем с помощью Uvicorn
     logger.info(f"Запуск сервера на {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
-
 
 if __name__ == '__main__':
     main()
